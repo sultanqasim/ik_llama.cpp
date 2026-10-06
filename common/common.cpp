@@ -316,7 +316,7 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
         }
 
         if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || common_speculative_type_is_dflash_family(stage.type)) && !params.has_dft()) {
-            return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model (-md/--model-draft)");
+            return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model or draft params");
         }
 
     }
@@ -481,8 +481,8 @@ struct cpu_affinity_restore {
     }
 };
 
-// cores of one class (P/E): primaries, then SMT siblings
-static std::vector<int32_t> cpu_detect_cores(bool with_siblings, bool efficiency) {
+// P-cores: primaries first, then the extra SMT siblings (for n_threads overflow)
+static std::vector<int32_t> cpu_detect_math_cpus(bool with_siblings) {
     std::vector<int32_t> primaries;
     std::vector<int32_t> extra;
 
@@ -510,9 +510,8 @@ static std::vector<int32_t> cpu_detect_cores(bool with_siblings, bool efficiency
             extra.clear();
             break;
         }
-        if (is_running_on_efficiency_core() != efficiency) {
-            // E-cores harm lockstep threading
-            continue;
+        if (is_running_on_efficiency_core()) {
+            continue; // efficiency cores harm lockstep threading
         }
 
         const std::string key = cpu_physical_core_key(cpu);
@@ -531,22 +530,12 @@ static std::vector<int32_t> cpu_detect_cores(bool with_siblings, bool efficiency
 }
 
 std::vector<int32_t> cpu_get_math_cpus() {
-    static const std::vector<int32_t> cpus = cpu_detect_cores(false, false);
-    return cpus;
-}
-
-std::vector<int32_t> cpu_get_efficiency_cpus() {
-    static const std::vector<int32_t> cpus = cpu_detect_cores(false, true);
+    static const std::vector<int32_t> cpus = cpu_detect_math_cpus(false);
     return cpus;
 }
 
 static std::vector<int32_t> cpu_affinity_auto_cpus() {
-    static const std::vector<int32_t> cpus = cpu_detect_cores(true, false);
-    return cpus;
-}
-
-static std::vector<int32_t> cpu_affinity_auto_cpus_draft() {
-    static const std::vector<int32_t> cpus = cpu_detect_cores(true, true);
+    static const std::vector<int32_t> cpus = cpu_detect_math_cpus(true);
     return cpus;
 }
 
@@ -573,10 +562,8 @@ static std::vector<int32_t> cpu_affinity_filter(const std::vector<int32_t> & cpu
 }
 
 #else
-std::vector<int32_t> cpu_get_math_cpus()       { return {}; }
-std::vector<int32_t> cpu_get_efficiency_cpus() { return {}; }
-static std::vector<int32_t> cpu_affinity_auto_cpus()       { return {}; }
-static std::vector<int32_t> cpu_affinity_auto_cpus_draft() { return {}; }
+std::vector<int32_t> cpu_get_math_cpus() { return {}; }
+static std::vector<int32_t> cpu_affinity_auto_cpus() { return {}; }
 static std::vector<int32_t> cpu_affinity_filter(const std::vector<int32_t> & cpus) { return cpus; }
 #endif // __x86_64__ && __linux__
 
@@ -593,18 +580,9 @@ int32_t cpu_get_num_math() {
     return cpu_get_num_physical_cores();
 }
 
-static std::vector<int32_t> cpu_affinity_resolve_impl(
-        const std::vector<int32_t> & cpus, bool auto_detect, const std::vector<int32_t> & auto_cpus) {
-    const std::vector<int32_t> resolved = (!cpus.empty() || !auto_detect) ? cpus : auto_cpus;
-    return cpu_affinity_filter(resolved);
-}
-
 std::vector<int32_t> cpu_affinity_resolve(const std::vector<int32_t> & cpus, bool auto_detect) {
-    return cpu_affinity_resolve_impl(cpus, auto_detect, cpu_affinity_auto_cpus());
-}
-
-std::vector<int32_t> cpu_affinity_resolve_draft(const std::vector<int32_t> & cpus, bool auto_detect) {
-    return cpu_affinity_resolve_impl(cpus, auto_detect, cpu_affinity_auto_cpus_draft());
+    const std::vector<int32_t> resolved = (!cpus.empty() || !auto_detect) ? cpus : cpu_affinity_auto_cpus();
+    return cpu_affinity_filter(resolved);
 }
 
 // Parse a CPU bitmask ("0x55", "85") into a list of logical CPU ids.
@@ -2391,7 +2369,6 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             return true;
         }
         params.cpu_affinity_auto = false;
-        params.cpu_affinity_configured = true;
         return true;
     }
     if (arg == "--cpu-range" || arg == "-cr") {
@@ -2402,13 +2379,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             return true;
         }
         params.cpu_affinity_auto = false;
-        params.cpu_affinity_configured = true;
         return true;
     }
     if (arg == "--cpu-affinity") {
         params.cpu_affinity.clear();
         params.cpu_affinity_auto = true;
-        params.cpu_affinity_configured = true;
         return true;
     }
     if (arg == "-prexp" || arg == "--prefetch-experts") {
@@ -3539,7 +3514,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "backend" });
     options.push_back({ "*",           "       --rpc SERVERS",          "comma separated list of RPC servers" });
     options.push_back({ "*",           "-cuda, --cuda-params",          "comma separate list of cuda parameters" });
-    options.push_back({ "*",           "-draft, --draft-params",        "comma separate list of draft model parameters (--cpu-affinity pins the draft to E-cores on Intel hybrid CPUs, -cr LIST picks CPUs)" });
+    options.push_back({ "*",           "-draft, --draft-params",        "comma separate list of draft model parameters" });
     if (llama_supports_mlock()) {
         options.push_back({ "*",           "       --mlock",                "force system to keep model in RAM rather than swapping or compressing" });
     }

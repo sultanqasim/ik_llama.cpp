@@ -137,9 +137,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!common_speculative_prepare_startup(params)) {
-        return 1;
-    }
+    common_speculative_prepare_startup(params);
 
     common_params_sampling & sparams = params.sparams;
 
