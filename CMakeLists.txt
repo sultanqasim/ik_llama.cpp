@@ -82,6 +82,7 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 
 # 3rd party libs
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
+option(LLAMA_OPENSSL "llama: use openssl to support HTTPS (needed for -hf model downloads)" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
 # Required for relocatable CMake package
@@ -229,8 +230,8 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
 # programs, examples and tests
 #
 
-add_subdirectory(common)
 add_subdirectory(vendor/cpp-httplib)
+add_subdirectory(common)
 if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
     include(CTest)
     add_subdirectory(tests)

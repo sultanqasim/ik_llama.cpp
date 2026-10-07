@@ -63,6 +63,10 @@ add_library(${TARGET} STATIC
     sampling.cpp
     console.h
     console.cpp
+    download.cpp
+    download.h
+    hf-cache.cpp
+    hf-cache.h
     json-partial.h
     json-partial.cpp
     llguidance.cpp
@@ -151,4 +155,5 @@ endif ()
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
-target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+# cpp-httplib is used by the HF hub downloader (download.cpp / hf-cache.cpp)
+target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} cpp-httplib PUBLIC llama Threads::Threads)

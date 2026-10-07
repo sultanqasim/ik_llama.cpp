@@ -16,6 +16,7 @@
 #include "llama.h"
 #include "chat.h"
 #include "json-schema-to-grammar.h"
+#include "download.h"
 #include <algorithm>
 #include <cerrno>
 #include <cinttypes>
@@ -844,22 +845,33 @@ void free_command_line(int argc, char** argv) {
 
 void gpt_params_handle_model_default(gpt_params & params) {
     if (!params.hf_repo.empty()) {
-        // short-hand to avoid specifying --hf-file -> default it to --model
-        if (params.hf_file.empty()) {
-            if (params.model.empty()) {
-                throw std::invalid_argument("error: --hf-repo requires either --hf-file or --model\n");
+        // -hf / -hfr / --hf-repo: resolve the repo (with optional :quant tag)
+        // via the Hugging Face hub API, downloading the model (and mmproj, if
+        // any) into the HF hub cache as needed and reusing cached files
+        // (ported from llama.cpp)
+        try {
+            const bool dl_mmproj = !params.no_mmproj
+                                && params.mmproj.path.empty()
+                                && params.mmproj.url.empty();
+            auto res = common_download_hf_model(params.hf_repo, params.hf_file, params.hf_token, dl_mmproj);
+            params.model = res.model_path;
+            if (!res.mmproj_path.empty()) {
+                params.mmproj.path = res.mmproj_path;
             }
-            params.hf_file = params.model;
-        } else if (params.model.empty()) {
-            params.model = fs_get_cache_file(string_split(params.hf_file, "/").back());
+        } catch (const std::exception & e) {
+            throw std::invalid_argument(string_format("error: %s\n", e.what()));
         }
-    } else if (!params.model_url.empty()) {
+        return;
+    }
+    if (!params.model_url.empty()) {
         if (params.model.empty()) {
             auto f = string_split(params.model_url, "#").front();
             f = string_split(f, "?").front();
             params.model = fs_get_cache_file(string_split(f, "/").back());
         }
-    } else if (params.model.empty()) {
+        return;
+    }
+    if (params.model.empty()) {
         params.model = DEFAULT_MODEL_PATH;
     }
 }
@@ -923,11 +935,12 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
-    gpt_params_handle_model_default(params);
-
+    // resolve the HF access token before downloading anything via -hf/-hfr
     if (params.hf_token.empty()) {
         get_env("HF_TOKEN", params.hf_token);
     }
+
+    gpt_params_handle_model_default(params);
 
     if (params.escape) {
         if (!params.prompt_is_binary) {
@@ -1877,7 +1890,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.hf_token = argv[i];
         return true;
     }
-    if (arg == "-hfr" || arg == "--hf-repo") {
+    if (arg == "-hf" || arg == "-hfr" || arg == "--hf-repo") {
         CHECK_ARG
         params.hf_repo = argv[i];
         return true;
@@ -1936,6 +1949,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--mmproj-url") {
         CHECK_ARG
         params.mmproj.url = argv[i];
+        return true;
+    }
+    if (arg == "--no-mmproj") {
+        params.no_mmproj = true;
         return true;
     }
     if (arg == "--no-mmproj-offload") {
@@ -3530,6 +3547,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --image FILE",           "path to an image file. use with multimodal models. Specify multiple times for batching" });
     options.push_back({ "*",           "       --audio FILE",           "path to an audio file for multimodal models. Specify multiple times for batching" });
     options.push_back({ "*",           "       --mmproj-url URL",       "URL to download the multimodal projector file" });
+    options.push_back({ "*",           "       --no-mmproj",            "explicitly disable multimodal projector, useful when using -hf" });
     options.push_back({ "*",           "       --no-mmproj-offload",    "do not offload multimodal projector to GPU (default: offload enabled)" });
     options.push_back({ "*",           "       --image-min-tokens N",   "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
     options.push_back({ "*",           "       --image-max-tokens N",   "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
@@ -3610,11 +3628,15 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "note: this argument can be repeated to add multiple scaled control vectors" });
     options.push_back({ "*",           "       --control-vector-layer-range START END",
                                                                         "layer range to apply the control vector(s) to, start and end inclusive" });
-    options.push_back({ "*",           "-m,    --model FNAME",          "model path (default: models/$filename with filename from --hf-file\n"
-                                                                        "or --model-url if set, otherwise %s)", DEFAULT_MODEL_PATH });
+    options.push_back({ "*",           "-m,    --model FNAME",          "model path (default: models/$filename with filename from --model-url\n"
+                                                                        "if set, otherwise %s)", DEFAULT_MODEL_PATH });
     options.push_back({ "*",           "-md,   --model-draft FNAME",    "draft model for speculative decoding (default: unused)" });
     options.push_back({ "*",           "-mu,   --model-url MODEL_URL",  "model download url (default: unused)" });
-    options.push_back({ "*",           "-hfr,  --hf-repo REPO",         "Hugging Face model repository (default: unused)" });
+    options.push_back({ "*",           "-hf,  -hfr, --hf-repo <user>/<model>[:quant]",
+                                                                         "Hugging Face model repository; quant is optional, case-insensitive, default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.\n"
+                                                                         "mmproj is also downloaded automatically if available. to disable, add --no-mmproj\n"
+                                                                         "example: ggml-org/gemma-3-4b-it-GGUF:Q4_K_M\n"
+                                                                         "(default: unused)" });
     options.push_back({ "*",           "-hff,  --hf-file FILE",         "Hugging Face model file (default: unused)" });
     options.push_back({ "*",           "-hft,  --hf-token TOKEN",       "Hugging Face access token (default: value from HF_TOKEN environment variable)" });
     options.push_back({ "*", "--spec-ckpt-mode MODE",         "checkpoint strategy for speculative decoding\n"
@@ -4296,6 +4318,67 @@ std::string fs_get_cache_file(const std::string & filename) {
     return cache_directory + filename;
 }
 
+// returns the path as a UTF-8 string, preserving its separators
+std::string fs_path_to_utf8(const std::filesystem::path & path) {
+    const auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
+
+void fs_write_atomic(const std::filesystem::path & path, const std::string & data) {
+    std::error_code ec;
+    std::filesystem::path path_tmp = path;
+    path_tmp += ".tmp";
+
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+
+    std::ofstream file(path_tmp, std::ios::binary);
+    file << data;
+    file.close();
+
+    if (!file.fail()) {
+        std::filesystem::rename(path_tmp, path, ec);
+    }
+
+    if (file.fail() || ec) {
+        std::filesystem::remove(path_tmp, ec);
+        throw std::runtime_error("failed to write file: " + fs_path_to_utf8(path));
+    }
+}
+
+// reads a path from the environment, an unset variable gives an empty path
+std::filesystem::path common_get_path_from_env(const std::string & name) {
+    const char * value = std::getenv(name.c_str());
+    return value ? std::filesystem::path(value) : std::filesystem::path();
+}
+
+std::string common_get_model_endpoint() {
+    std::string endpoint;
+    const char * value = std::getenv("MODEL_ENDPOINT");
+    if (value) {
+        endpoint = value;
+    }
+    if (endpoint.empty()) {
+        // the HF_ENDPOINT variable is respected for backward compatibility
+        value = std::getenv("HF_ENDPOINT");
+        if (value) {
+            endpoint = value;
+        }
+    }
+    if (endpoint.empty()) {
+        return "https://huggingface.co/";
+    }
+    if (endpoint.back() != '/') {
+        endpoint += '/';
+    }
+    return endpoint;
+}
+
+std::string common_build_user_agent() {
+    return std::string("ik_llama.cpp/b") + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT;
+}
+
 
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
@@ -4304,9 +4387,14 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     llama_model * model = nullptr;
 
-    if (!params.hf_repo.empty() && !params.hf_file.empty()) {
+    // -hf/-hfr resolve and download the model into the HF hub cache during
+    // argument parsing; when the local model file already exists, load it
+    // directly instead of re-downloading it
+    const bool model_file_ready = !params.model.empty() && std::filesystem::exists(params.model);
+
+    if (!params.hf_repo.empty() && !params.hf_file.empty() && !model_file_ready) {
         model = llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
-    } else if (!params.model_url.empty()) {
+    } else if (!params.model_url.empty() && params.hf_repo.empty()) {
         model = llama_load_model_from_url(params.model_url.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
     } else {
         model = llama_model_load_from_file(params.model.c_str(), mparams);
