@@ -554,6 +554,25 @@ static hf_cache::hf_file find_best_mmproj(const hf_cache::hf_files & files,
     return find_best_sibling(files, model, "mmproj");
 }
 
+// note: eagle3 is not ported, the eagle3 speculative stage is not implemented in ik_llama.cpp
+static hf_cache::hf_file find_best_mtp(const hf_cache::hf_files & files,
+                                       const std::string        & model,
+                                       const std::string        & tag = "") {
+    return find_best_sibling(files, model, "mtp-", tag);
+}
+
+static hf_cache::hf_file find_best_dflash(const hf_cache::hf_files & files,
+                                          const std::string        & model,
+                                          const std::string        & tag = "") {
+    return find_best_sibling(files, model, "dflash-", tag);
+}
+
+static hf_cache::hf_file find_best_dspark(const hf_cache::hf_files & files,
+                                          const std::string        & model,
+                                          const std::string        & tag = "") {
+    return find_best_sibling(files, model, "dspark-", tag);
+}
+
 static bool gguf_filename_is_model(const std::string & filepath) {
     if (!string_ends_with(filepath, ".gguf")) {
         return false;
@@ -635,7 +654,9 @@ common_hf_download_result common_download_hf_model(
         const std::string & hf_repo,
         const std::string & hf_file,
         const std::string & hf_token,
-        bool download_mmproj) {
+        bool download_mmproj,
+        const common_hf_download_spec & download_spec,
+        bool sidecar_overrides_model) {
     common_hf_download_result result;
 
     auto [repo, tag] = common_download_split_repo_tag(hf_repo);
@@ -670,19 +691,44 @@ common_hf_download_result common_download_hf_model(
         }
     } else {
         primary = find_best_model(all, tag);
-        if (primary.path.empty()) {
+        // a requested sidecar can resolve on its own, without a full model of the same tag
+        if (primary.path.empty() && !download_spec.mtp && !download_spec.dflash && !download_spec.dspark) {
             LOG_ERR("%s: no GGUF files found in repository %s\n", __func__, repo.c_str());
             list_available_gguf_files(all);
             throw std::runtime_error(string_format("no GGUF files found in Hugging Face repo '%s'", repo.c_str()));
         }
     }
 
-    auto model_files = get_split_files(all, primary);
+    auto model_files = primary.path.empty() ? hf_cache::hf_files{} : get_split_files(all, primary);
 
     hf_cache::hf_file mmproj;
     if (download_mmproj && !primary.path.empty()) {
         mmproj = find_best_mmproj(all, primary.path);
     }
+
+    // speculative sidecar files (ported from llama.cpp)
+    hf_cache::hf_file mtp, dflash, dspark;
+    if (download_spec.mtp) {
+        mtp = find_best_mtp(all, primary.path, tag);
+    }
+    if (download_spec.dflash) {
+        dflash = find_best_dflash(all, primary.path, tag);
+    }
+    if (download_spec.dspark) {
+        dspark = find_best_dspark(all, primary.path, tag);
+    }
+
+    if (primary.path.empty() &&
+        mtp.local_path.empty() && dflash.local_path.empty() && dspark.local_path.empty()) {
+        LOG_ERR("%s: no GGUF files found in repository %s\n", __func__, repo.c_str());
+        list_available_gguf_files(all);
+        throw std::runtime_error(string_format("no GGUF files found in Hugging Face repo '%s'", repo.c_str()));
+    }
+
+    // when a requested sidecar is found, a draft repo resolves to the sidecar
+    // instead of a full model (llama.cpp --hf-repo-draft behavior)
+    const bool sidecar_found = !mtp.local_path.empty() || !dflash.local_path.empty() || !dspark.local_path.empty();
+    const bool skip_model = sidecar_overrides_model && sidecar_found;
 
     // download the files as needed (cached files are skipped)
     std::vector<std::pair<std::string, std::string>> url_paths;
@@ -693,25 +739,47 @@ common_hf_download_result common_download_hf_model(
         }
         url_paths.emplace_back(f.url, f.local_path);
     };
-    for (const auto & f : model_files) {
-        add_task(f);
+    if (!skip_model) {
+        for (const auto & f : model_files) {
+            add_task(f);
+        }
     }
     if (!mmproj.local_path.empty()) {
         add_task(mmproj);
+    }
+    if (!mtp.local_path.empty()) {
+        add_task(mtp);
+    }
+    if (!dflash.local_path.empty()) {
+        add_task(dflash);
+    }
+    if (!dspark.local_path.empty()) {
+        add_task(dspark);
     }
 
     common_download_files(url_paths, hf_token, /*skip_etag=*/true);
 
     // finalize: link or move the blobs into the snapshots dir, use as model path
-    for (const auto & f : model_files) {
-        if (f.path == primary.path) {
-            result.model_path = hf_cache::finalize_file(f);
-        } else {
-            hf_cache::finalize_file(f);
+    if (!skip_model) {
+        for (const auto & f : model_files) {
+            if (f.path == primary.path) {
+                result.model_path = hf_cache::finalize_file(f);
+            } else {
+                hf_cache::finalize_file(f);
+            }
         }
     }
     if (!mmproj.local_path.empty()) {
         result.mmproj_path = hf_cache::finalize_file(mmproj);
+    }
+    if (!mtp.local_path.empty()) {
+        result.mtp_path = hf_cache::finalize_file(mtp);
+    }
+    if (!dflash.local_path.empty()) {
+        result.dflash_path = hf_cache::finalize_file(dflash);
+    }
+    if (!dspark.local_path.empty()) {
+        result.dspark_path = hf_cache::finalize_file(dspark);
     }
 
     return result;

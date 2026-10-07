@@ -655,7 +655,78 @@ void free_command_line(int argc, char** argv) {
 }
 
 
+// resolve a draft model from a HF repo (-hfd/--hf-repo-draft), mirroring the
+// llama.cpp --spec-draft-hf behavior: when no speculative type is requested,
+// the type is inferred from the sidecar shipped by the draft repo (mtp, then
+// dspark, then dflash), falling back to a full model draft
+static void gpt_params_handle_hf_draft_repo(gpt_params & params) {
+    auto & spec = params.speculative;
+
+    if (params.hf_repo.empty() && params.model.empty() && params.model_url.empty()) {
+        throw std::runtime_error("--hf-repo-draft requires a target model (-hf, -m or --model-url)");
+    }
+
+    // an explicit draft file selection (-md with -hfd) disables the sidecar
+    // resolution of the draft repo
+    const bool explicit_file = !spec.mparams_dft.hf_file.empty();
+    const bool type_requested = spec.has_stage_chain();
+
+    common_hf_download_spec dls;
+    if (!explicit_file) {
+        if (type_requested) {
+            dls.mtp    = spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+            dls.dflash = spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+            dls.dspark = spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK);
+        } else {
+            // without a requested type, discover every sidecar the draft repo
+            // ships to infer the type below
+            dls.mtp = dls.dflash = dls.dspark = true;
+        }
+    }
+
+    auto res = common_download_hf_model(spec.mparams_dft.hf_repo, spec.mparams_dft.hf_file,
+                                        params.hf_token, /*download_mmproj=*/false, dls,
+                                        /*sidecar_overrides_model=*/!explicit_file);
+
+    // the draft repo resolves to its sidecar when one was requested and found,
+    // else to the resolved full model
+    if (!res.mtp_path.empty()) {
+        if (!type_requested) {
+            spec.type = COMMON_SPECULATIVE_TYPE_MTP;
+        }
+        spec.model = res.mtp_path;
+    } else if (!res.dspark_path.empty()) {
+        if (!type_requested) {
+            spec.type = COMMON_SPECULATIVE_TYPE_DSPARK;
+        }
+        spec.model = res.dspark_path;
+    } else if (!res.dflash_path.empty()) {
+        if (!type_requested) {
+            spec.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+        }
+        spec.model = res.dflash_path;
+    } else {
+        if (!type_requested) {
+            spec.type = COMMON_SPECULATIVE_TYPE_DRAFT;
+        }
+        spec.model = res.model_path;
+    }
+
+    LOG_INF("%s: draft model from HF repo '%s' resolved to '%s'\n",
+            __func__, spec.mparams_dft.hf_repo.c_str(), spec.model.c_str());
+}
+
 void gpt_params_handle_model_default(gpt_params & params) {
+    // resolve the draft model from a HF repo first (-hfd), so that the main
+    // repo's sidecar fallback below only kicks in when no draft was resolved
+    if (!params.speculative.mparams_dft.hf_repo.empty()) {
+        try {
+            gpt_params_handle_hf_draft_repo(params);
+        } catch (const std::exception & e) {
+            throw std::invalid_argument(string_format("error: %s\n", e.what()));
+        }
+    }
+
     if (!params.hf_repo.empty()) {
         // -hf / -hfr / --hf-repo: resolve the repo (with optional :quant tag)
         // via the Hugging Face hub API, downloading the model (and mmproj, if
@@ -665,10 +736,36 @@ void gpt_params_handle_model_default(gpt_params & params) {
             const bool dl_mmproj = !params.no_mmproj
                                 && params.mmproj.path.empty()
                                 && params.mmproj.url.empty();
-            auto res = common_download_hf_model(params.hf_repo, params.hf_file, params.hf_token, dl_mmproj);
+
+            // speculative sidecars are downloaded when the matching stage was
+            // requested via --spec-type (mtp, dflash, dspark)
+            common_hf_download_spec dls;
+            dls.mtp    = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+            dls.dflash = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+            dls.dspark = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK);
+
+            auto res = common_download_hf_model(params.hf_repo, params.hf_file, params.hf_token, dl_mmproj, dls);
             params.model = res.model_path;
             if (!res.mmproj_path.empty()) {
                 params.mmproj.path = res.mmproj_path;
+            }
+
+            // wire a requested sidecar of the main repo as the draft model when
+            // none was explicitly provided (ported from llama.cpp)
+            if (params.speculative.model.empty()) {
+                if (dls.mtp && !res.mtp_path.empty()) {
+                    params.speculative.model = res.mtp_path;
+                    LOG_INF("%s: using MTP sidecar '%s' from repo '%s' as draft model\n",
+                            __func__, params.speculative.model.c_str(), params.hf_repo.c_str());
+                } else if (dls.dspark && !res.dspark_path.empty()) {
+                    params.speculative.model = res.dspark_path;
+                    LOG_INF("%s: using DSpark sidecar '%s' from repo '%s' as draft model\n",
+                            __func__, params.speculative.model.c_str(), params.hf_repo.c_str());
+                } else if (dls.dflash && !res.dflash_path.empty()) {
+                    params.speculative.model = res.dflash_path;
+                    LOG_INF("%s: using DFlash sidecar '%s' from repo '%s' as draft model\n",
+                            __func__, params.speculative.model.c_str(), params.hf_repo.c_str());
+                }
             }
         } catch (const std::exception & e) {
             throw std::invalid_argument(string_format("error: %s\n", e.what()));
@@ -808,6 +905,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_MODEL_ALIAS",      params.model_alias);
     get_env("LLAMA_ARG_HF_REPO",          params.hf_repo);
     get_env("LLAMA_ARG_HF_FILE",          params.hf_file);
+    get_env("LLAMA_ARG_SPEC_DRAFT_HF_REPO", params.speculative.mparams_dft.hf_repo);
     get_env("LLAMA_ARG_THREADS",          params.n_threads);
     get_env("LLAMA_ARG_CTX_SIZE",         params.n_ctx);
     get_env("LLAMA_ARG_N_PARALLEL",       params.n_parallel);
@@ -1636,6 +1734,13 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-md" || arg == "--model-draft") {
         CHECK_ARG
         params.speculative.model = argv[i];
+        // will be used as the file name if -hfd/--hf-repo-draft is set
+        params.speculative.mparams_dft.hf_file = argv[i];
+        return true;
+    }
+    if (arg == "-hfd" || arg == "-hfrd" || arg == "--hf-repo-draft") {
+        CHECK_ARG
+        params.speculative.mparams_dft.hf_repo = argv[i];
         return true;
     }
     if (arg == "--spec-stage") {
@@ -3432,7 +3537,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "layer range to apply the control vector(s) to, start and end inclusive" });
     options.push_back({ "*",           "-m,    --model FNAME",          "model path (default: models/$filename with filename from --model-url\n"
                                                                         "if set, otherwise %s)", DEFAULT_MODEL_PATH });
-    options.push_back({ "*",           "-md,   --model-draft FNAME",    "draft model for speculative decoding (default: unused)" });
+    options.push_back({ "*",           "-md,   --model-draft FNAME",    "draft model for speculative decoding; with -hfd, the file to use from the draft repo (default: unused)" });
     options.push_back({ "*",           "-mu,   --model-url MODEL_URL",  "model download url (default: unused)" });
     options.push_back({ "*",           "-hf,  -hfr, --hf-repo <user>/<model>[:quant]",
                                                                          "Hugging Face model repository; quant is optional, case-insensitive, default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.\n"
@@ -3441,6 +3546,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                          "(default: unused)" });
     options.push_back({ "*",           "-hff,  --hf-file FILE",         "Hugging Face model file (default: unused)" });
     options.push_back({ "*",           "-hft,  --hf-token TOKEN",       "Hugging Face access token (default: value from HF_TOKEN environment variable)" });
+    options.push_back({ "*",           "-hfd,  -hfrd, --hf-repo-draft <user>/<model>[:quant]",
+                                                                         "Same as -hf, but for the draft model; when no --spec-type is given, the type is inferred from the sidecar shipped by the repo, if any\n"
+                                                                         "(default: unused)" });
     options.push_back({ "*", "--spec-ckpt-mode MODE",         "checkpoint strategy for speculative decoding\n"
                                                               "  auto         auto-select: per-step if CUDA full-GPU, gpu-fallback otherwise (default)\n"
                                                               "  per-step     save architecture state per draft step; no re-decode on rejection\n"

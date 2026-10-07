@@ -27,9 +27,18 @@ void common_download_files(const std::vector<std::pair<std::string, std::string>
                            const std::string & bearer_token = "",
                            bool skip_etag = true);
 
+struct common_hf_download_spec {
+    bool mtp    = false; // also download the mtp-* sidecar, if available
+    bool dflash = false; // also download the dflash-* sidecar, if available
+    bool dspark = false; // also download the dspark-* sidecar, if available
+};
+
 struct common_hf_download_result {
     std::string model_path;  // local path of the model (first split, if sharded)
     std::string mmproj_path; // local path of the mmproj file, empty if none found
+    std::string mtp_path;    // local path of the mtp-* sidecar, empty if none found
+    std::string dflash_path; // local path of the dflash-* sidecar, empty if none found
+    std::string dspark_path; // local path of the dspark-* sidecar, empty if none found
 };
 
 // resolve and download the model (and optionally the mmproj sibling) from a HF
@@ -37,9 +46,14 @@ struct common_hf_download_result {
 // hf_repo format: <user>/<model>[:quant]
 // hf_file: exact file within the repo (overrides the :quant tag, may be empty)
 // hf_token: HF access token, may be empty
+// download_spec: speculative sidecar files to download when available
+// sidecar_overrides_model: when a requested sidecar is found, skip the model
+//                          download (draft repos resolve to the sidecar)
 // throws std::runtime_error on failure
 common_hf_download_result common_download_hf_model(
         const std::string & hf_repo,
         const std::string & hf_file,
         const std::string & hf_token,
-        bool download_mmproj);
+        bool download_mmproj,
+        const common_hf_download_spec & download_spec = {},
+        bool sidecar_overrides_model = false);
