@@ -17,6 +17,7 @@
 #include "log.h"
 #include <set>
 #include <cmath>
+#include <filesystem>
 #include <string>
 #include <sstream>
 #include <string_view>
@@ -709,6 +710,29 @@ bool fs_create_directory_with_parents(const std::string & path);
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
 
+// returns the path as a UTF-8 string, preserving its separators
+std::string fs_path_to_utf8(const std::filesystem::path & path);
+
+// write data to file atomically (write to <path>.tmp, then rename)
+void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
+
+//
+// Environment utils
+//
+
+// reads a path from the environment, an unset variable gives an empty path
+std::filesystem::path common_get_path_from_env(const std::string & name);
+
+//
+// Model endpoint utils
+//
+
+// returns the model endpoint (default: https://huggingface.co/, can be
+// overridden via the MODEL_ENDPOINT or HF_ENDPOINT environment variables)
+std::string common_get_model_endpoint();
+
+// user agent for HTTP requests, for example "ik_llama.cpp/b1234-abcdef"
+std::string common_build_user_agent();
 
 //
 // Model utils
