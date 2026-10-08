@@ -515,7 +515,7 @@ int main(int argc, char ** argv) {
     }
 
     if (params.model_alias == "unknown") {
-        params.model_alias = params.model;
+        params.model_alias = params.hf_repo.empty() ? params.model : params.hf_repo;
     }
 
     llama_backend_init();
